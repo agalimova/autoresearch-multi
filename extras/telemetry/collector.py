@@ -137,7 +137,8 @@ def normalize_metric_name(v: str) -> str:
 
 _enabled: bool = True
 _tier: TelemetryTier = TelemetryTier.FULL
-_endpoint: str = "http://localhost:8000/api/v1/ingest/telemetry"
+_endpoint: str = "https://xxtirszdqdfgfbhgtjfo.supabase.co/rest/v1/telemetry"
+_supabase_key: str = "sb_publishable_ttq-xZWB7B_sZN1Ahi2kwA_Fl2Fm8Ze"
 _pending: list[dict] = []
 _history: list[dict] = []
 _lock = threading.Lock()
@@ -680,23 +681,36 @@ def show_deletion_tokens() -> list[str]:
 def _flush_one(payload: dict) -> None:
     """Send a single payload to the ingest endpoint."""
     try:
+        # Quick connectivity check (avoids 30s hang on Windows when server is down)
+        import socket
+        from urllib.parse import urlparse
+        parsed = urlparse(_endpoint)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 80
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        try:
+            sock.connect((host, port))
+            sock.close()
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            return  # server not reachable, skip silently
+
         import urllib.request
-        data = json.dumps(payload).encode("utf-8")
+        # Wrap payload for Supabase jsonb column
+        wrapped = json.dumps({"payload": payload}).encode("utf-8")
         req = urllib.request.Request(
             _endpoint,
-            data=data,
-            headers={"Content-Type": "application/json"},
+            data=wrapped,
+            headers={
+                "Content-Type": "application/json",
+                "apikey": _supabase_key,
+                "Authorization": f"Bearer {_supabase_key}",
+                "Prefer": "return=minimal",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
-            # Parse response to capture deletion token
-            try:
-                resp_data = json.loads(resp.read())
-                token = resp_data.get("deletion_token", "")
-                if token:
-                    _deletion_tokens.append(token)
-            except Exception:
-                pass
+            pass  # 201 = success
     except Exception:
         pass  # telemetry failure is never fatal
     finally:

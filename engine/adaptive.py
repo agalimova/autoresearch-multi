@@ -53,6 +53,14 @@ class AdaptiveSearch:
         self.results_path = results_path
         self.all_results: list[dict] = []
         self._tested: set[tuple] = set()
+        # Explicit interaction tracking: (impl_a, impl_b) -> delta
+        self.interactions: dict[tuple, float] = {}
+        # Families where best-in-family < global_best * threshold
+        self._dead_families: set[str] = set()
+        # Crash tracking: impl_name -> consecutive crash count
+        self._crash_counts: dict[str, int] = {}
+        # Dominated impls: individually archived (not just by family)
+        self._dead_impls: set[str] = set()
 
         if results_path and results_path.exists():
             self.all_results = json.loads(results_path.read_text())
@@ -91,10 +99,15 @@ class AdaptiveSearch:
         return True
 
     def _test(self, combo: dict, round_num: int) -> Optional[dict]:
-        """Test one combo. Skip if already tested. Save incrementally."""
+        """Test one combo. Skip if already tested or contains dead/crashed impls."""
         key = tuple(sorted(combo.items()))
         if key in self._tested:
             return None
+
+        # Skip combos containing impls that crashed 3+ times
+        for impl in combo.values():
+            if impl != "base" and self._crash_counts.get(impl, 0) >= 3:
+                return None
 
         r = self.runner.run(combo, metric_name=self.metric)
         entry = {
@@ -105,6 +118,21 @@ class AdaptiveSearch:
         }
         self.all_results.append(entry)
         self._tested.add(key)
+
+        # Track crashes per impl
+        if r.error:
+            for impl in combo.values():
+                if impl != "base":
+                    self._crash_counts[impl] = self._crash_counts.get(impl, 0) + 1
+                    if self._crash_counts[impl] >= 3:
+                        self._dead_impls.add(impl)
+                        print(f"  Auto-skipping {impl} (3 consecutive crashes)", flush=True)
+        else:
+            # Clear crash counts on success
+            for impl in combo.values():
+                if impl != "base":
+                    self._crash_counts[impl] = 0
+
         self._save()
         return entry
 
@@ -154,6 +182,8 @@ class AdaptiveSearch:
         # Mode 1: EXPLORE — coverage + random
         print(f"\n[EXPLORE]", flush=True)
         self._round_coverage(1)
+        self._update_interactions()
+        self._update_dead_families()
         self.save_state()
 
         if n_rounds < 2:
@@ -164,27 +194,32 @@ class AdaptiveSearch:
         for s in var_slots:
             print(f"  {s} = {best_combo[s]}", flush=True)
 
-        # Mode 2: EXPLOIT — Optuna Bayesian or grid fallback
+        # Mode 2: EXPLOIT — Optuna Bayesian or grid, skip dead families
         print(f"\n[EXPLOIT]", flush=True)
         self._round_exploit(2, best_combo, var_slots)
+        self._update_interactions()
+        self._update_dead_families()
         self.save_state()
 
         if n_rounds < 3:
             return self._valid_sorted()
 
-        # Mode 3: COMBINE — test near-miss pairs (from n-autoresearch)
+        # Mode 3: COMBINE — prioritize pairs with positive interaction signal
         print(f"\n[COMBINE]", flush=True)
         best_combo, best_acc = self._current_best()
         self._round_combine(3, var_slots)
+        self._update_interactions()
+        self.save_state()
 
         if n_rounds < 4:
             return self._valid_sorted()
 
-        # Mode 4: NARROW — fine-tune within winning region
+        # Mode 4: NARROW — fine-tune within winning region, skip dead families
         print(f"\n[NARROW]", flush=True)
         best_combo, best_acc = self._current_best()
         print(f"Combine best: {best_acc:.4f}", flush=True)
         self._round_narrow(4, best_combo, var_slots)
+        self._update_interactions()
 
         final_best, final_acc = self._current_best()
         print(f"\nFinal best: {final_acc:.4f}", flush=True)
@@ -323,7 +358,10 @@ class AdaptiveSearch:
         # Also cross with feature variants if multiple slots
         if len(var_slots) > 1:
             feat_slot = [s for s in var_slots if s != target_slot][0]
-            feat_impls = avail.get(feat_slot, ["base"])
+            feat_impls = [
+                f for f in avail.get(feat_slot, ["base"])
+                if not self._is_dead(f)
+            ]
             best_model = best.params.get("impl", best_combo[target_slot])
             remaining = max(0, self.budget - len(study.trials))
 
@@ -344,7 +382,8 @@ class AdaptiveSearch:
         best_impl = best_combo[target_slot]
         best_family = best_impl.split("_")[0]
         family_impls = [
-            i for i in avail.get(target_slot, []) if i.startswith(best_family)
+            i for i in avail.get(target_slot, [])
+            if i.startswith(best_family) and not self._is_dead(i)
         ]
 
         print(f"\nRound {round_num}: {len(family_impls)} {best_family} variants "
@@ -432,29 +471,40 @@ class AdaptiveSearch:
                     print(f"  [combine {tested}] {entry['val_acc']:.4f} | "
                           f"{vs}={miss_impl}", flush=True)
 
-        # Also test near-miss × near-miss across slots
+        # Test near-miss × near-miss pairs, prioritized by prior interaction signal
         if len(near_misses) >= 2:
+            cross_pairs: list[tuple[float, str, str, str, str]] = []
             slots_with_nm = list(near_misses.keys())
             for i in range(len(slots_with_nm)):
                 for j in range(i + 1, len(slots_with_nm)):
-                    if tested >= self.budget:
-                        break
                     s1, s2 = slots_with_nm[i], slots_with_nm[j]
-                    for m1 in near_misses[s1][:2]:
-                        for m2 in near_misses[s2][:2]:
-                            if tested >= self.budget:
-                                break
-                            combo = dict(best_combo)
-                            combo[s1] = m1
-                            combo[s2] = m2
-                            entry = self._test(combo, round_num)
-                            if entry:
-                                tested += 1
-                                print(f"  [combine {tested}] {entry['val_acc']:.4f} | "
-                                      f"{s1}={m1} + {s2}={m2}", flush=True)
+                    for m1 in near_misses[s1]:
+                        for m2 in near_misses[s2]:
+                            # Score by prior interaction data if available
+                            pair_key = tuple(sorted((m1, m2)))
+                            prior_delta = self.interactions.get(pair_key, 0.0)
+                            cross_pairs.append((prior_delta, s1, m1, s2, m2))
+
+            # Test highest-interaction pairs first (most likely superadditive)
+            cross_pairs.sort(key=lambda x: -x[0])
+
+            for prior_delta, s1, m1, s2, m2 in cross_pairs:
+                if tested >= self.budget:
+                    break
+                if self._is_dead(m1) or self._is_dead(m2):
+                    continue
+                combo = dict(best_combo)
+                combo[s1] = m1
+                combo[s2] = m2
+                entry = self._test(combo, round_num)
+                if entry:
+                    tested += 1
+                    signal = f" (prior delta={prior_delta:+.4f})" if prior_delta else ""
+                    print(f"  [combine {tested}] {entry['val_acc']:.4f} | "
+                          f"{s1}={m1} + {s2}={m2}{signal}", flush=True)
 
     def _round_narrow(self, round_num: int, best_combo: dict, var_slots: list[str]):
-        """Round 3: test neighbors of the current best in each variable slot."""
+        """Round 4: test neighbors of the current best, skip dead families."""
         avail = self.runner.discover()
         slot_names = self._slot_names()
 
@@ -468,8 +518,11 @@ class AdaptiveSearch:
             best_impl = best_combo[vs]
             best_family = best_impl.split("_")[0]
 
-            # Test other impls from the same family
-            neighbors = [i for i in impls if i.startswith(best_family) and i != best_impl]
+            neighbors = [
+                i for i in impls
+                if i.startswith(best_family) and i != best_impl
+                and not self._is_dead(i)
+            ]
             for impl in neighbors:
                 if tested >= self.budget:
                     break
@@ -480,6 +533,110 @@ class AdaptiveSearch:
                     tested += 1
                     acc = entry["val_acc"]
                     print(f"  [{tested}] {acc:.4f} | {vs}={impl}", flush=True)
+
+    def _update_interactions(self):
+        """Compute interaction deltas for all multi-slot combos tested so far.
+
+        For a combo with impls A (in slot1) and B (in slot2):
+          predicted = base + (A_solo - base) + (B_solo - base)
+          actual    = combo metric
+          delta     = actual - predicted
+
+        Positive delta = superadditive (A+B better than expected).
+        Stored in self.interactions keyed by (impl_a, impl_b).
+        """
+        valid = {
+            tuple(sorted(r["combo"].items())): r["val_acc"]
+            for r in self.all_results if not r.get("error")
+        }
+        if not valid:
+            return
+
+        slot_names = self._slot_names()
+        base_key = tuple(sorted((s, "base") for s in slot_names))
+        base_metric = valid.get(base_key, 0.0)
+        if base_metric == 0.0:
+            return
+
+        for combo_key, actual in valid.items():
+            combo = dict(combo_key)
+            non_base = {s: v for s, v in combo.items() if v != "base"}
+            if len(non_base) < 2:
+                continue
+
+            predicted = base_metric
+            for slot, impl in non_base.items():
+                solo = dict.fromkeys(slot_names, "base")
+                solo[slot] = impl
+                solo_key = tuple(sorted(solo.items()))
+                solo_metric = valid.get(solo_key, base_metric)
+                predicted += (solo_metric - base_metric)
+
+            delta = actual - predicted
+            # Key by the pair of non-base impls (order-independent)
+            impl_pair = tuple(sorted(non_base.values()))
+            self.interactions[impl_pair] = delta
+
+    def _update_dead_families(self, threshold: float = 0.95):
+        """Mark dead families and dominated impls.
+
+        Family pruning: best-in-family < global_best * threshold.
+        Dominance pruning: impl's best combo < another impl's solo in same slot.
+        """
+        _, global_best = self._current_best()
+        if global_best == 0.0:
+            return
+
+        cutoff = global_best * threshold
+
+        for slot in self._variable_slots():
+            # Family-level pruning
+            families = self._families(slot)
+            for family, impls in families.items():
+                best_in_family = 0.0
+                for r in self.all_results:
+                    if r.get("error"):
+                        continue
+                    impl = r["combo"].get(slot, "base")
+                    if impl in impls:
+                        best_in_family = max(best_in_family, r["val_acc"])
+
+                if best_in_family > 0 and best_in_family < cutoff:
+                    if family != "base":
+                        self._dead_families.add(family)
+
+            # Dominance pruning: per-impl within each slot
+            impl_best: dict[str, float] = {}
+            for r in self.all_results:
+                if r.get("error"):
+                    continue
+                impl = r["combo"].get(slot, "base")
+                impl_best[impl] = max(impl_best.get(impl, 0.0), r["val_acc"])
+
+            if len(impl_best) < 2:
+                continue
+            best_solo = max(impl_best.values())
+            for impl, best_metric in impl_best.items():
+                if impl == "base":
+                    continue
+                if best_metric > 0 and best_metric < best_solo * threshold:
+                    self._dead_impls.add(impl)
+
+        if self._dead_families:
+            print(f"  Dead families (< {threshold:.0%} of best): "
+                  f"{', '.join(sorted(self._dead_families))}", flush=True)
+        new_dead = self._dead_impls - self._dead_families
+        if new_dead:
+            print(f"  Dominated impls: {', '.join(sorted(new_dead))}", flush=True)
+
+    def _is_dead(self, impl: str) -> bool:
+        """Check if an impl is dead (by family, dominance, or crash)."""
+        if impl in self._dead_impls:
+            return True
+        if self._crash_counts.get(impl, 0) >= 3:
+            return True
+        family = impl.split("_")[0]
+        return family in self._dead_families
 
     def _current_best(self) -> tuple[dict, float]:
         valid = self._valid_sorted()
@@ -493,6 +650,47 @@ class AdaptiveSearch:
         valid.sort(key=lambda x: -x["val_acc"])
         return valid
 
+    def search_state(self) -> dict:
+        """Export current search state for the LLM proposer.
+
+        Returns everything the LLM needs to make an informed proposal:
+        interaction map, dead families, best combos, per-slot rankings.
+        """
+        best_combo, best_acc = self._current_best()
+        var_slots = self._variable_slots()
+
+        # Per-slot rankings
+        slot_rankings: dict[str, list[dict]] = {}
+        for slot in var_slots:
+            impl_best: dict[str, float] = {}
+            for r in self.all_results:
+                if r.get("error"):
+                    continue
+                impl = r["combo"].get(slot, "base")
+                impl_best[impl] = max(impl_best.get(impl, 0.0), r["val_acc"])
+            ranked = sorted(impl_best.items(), key=lambda x: -x[1])
+            slot_rankings[slot] = [
+                {"impl": impl, "best_acc": acc, "dead": self._is_dead(impl)}
+                for impl, acc in ranked
+            ]
+
+        # Top interactions (positive and negative)
+        sorted_interactions = sorted(
+            self.interactions.items(), key=lambda x: abs(x[1]), reverse=True,
+        )
+
+        return {
+            "best_combo": best_combo,
+            "best_acc": best_acc,
+            "slot_rankings": slot_rankings,
+            "interactions": [
+                {"pair": list(pair), "delta": delta}
+                for pair, delta in sorted_interactions[:10]
+            ],
+            "dead_families": sorted(self._dead_families),
+            "tested_count": len(self._tested),
+        }
+
     def summary(self) -> str:
         valid = self._valid_sorted()
         lines = [
@@ -502,4 +700,11 @@ class AdaptiveSearch:
         for r in valid[:5]:
             combo = " + ".join(f"{v}" for s, v in r["combo"].items() if v != "base") or "base"
             lines.append(f"  {r['val_acc']:.4f} | {combo}")
+        if self.interactions:
+            top = sorted(self.interactions.items(), key=lambda x: -x[1])[:3]
+            lines.append("Top interactions:")
+            for pair, delta in top:
+                lines.append(f"  {'+'.join(pair)}: {delta:+.4f}")
+        if self._dead_families:
+            lines.append(f"Dead families: {', '.join(sorted(self._dead_families))}")
         return "\n".join(lines)

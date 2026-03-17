@@ -1,33 +1,30 @@
 """
-Warm-start checkpoint manager.
+Warm-start checkpoint manager for neural net pipelines.
 
-Saves the best model state after each run. Next run can load it
-instead of training from scratch. Keeps only the best + latest.
+Saves the best model state after each combo. Next combo can warm-start
+from the best weights instead of random initialization.
 
-Inspired by soveshmohapatra/autoresearch-2.0 and thenamangoyal/autoresearch.
+Only active for PyTorch and Keras models. Sklearn models are stateless.
 
 Usage:
     ckpt = CheckpointManager("results/checkpoints")
     
     # After training:
-    ckpt.save(model, optimizer, metric_value=0.93, config=config)
+    ckpt.save(model, metric_value=0.93)
     
     # Before next training:
-    state = ckpt.load_best()
-    if state:
-        model.load_state_dict(state["model"])
-        print(f"Warm-starting from {state['metric']:.4f}")
+    ckpt.warm_start(model)  # loads best weights if available
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 
 class CheckpointManager:
-    """Manages best + latest checkpoints for warm-starting."""
+    """Manages best checkpoint for warm-starting across combos."""
 
     def __init__(self, checkpoint_dir: str | Path = "results/checkpoints"):
         self.dir = Path(checkpoint_dir)
@@ -38,92 +35,84 @@ class CheckpointManager:
     def _load_meta(self) -> dict:
         if self.meta_path.exists():
             return json.loads(self.meta_path.read_text())
-        return {"best_metric": 0.0, "best_file": "", "latest_file": "", "count": 0}
+        return {"best_metric": 0.0, "best_file": "", "framework": ""}
 
     def _save_meta(self) -> None:
         self.meta_path.write_text(json.dumps(self._meta, indent=2))
 
-    def save(self, model, optimizer, *, metric_value: float, config: dict) -> Path:
-        """Save checkpoint. Keeps best + latest only."""
-        try:
+    def save(self, model, *, metric_value: float) -> bool:
+        """Save model if it beats the current best. Returns True if saved."""
+        if metric_value <= self._meta.get("best_metric", 0):
+            return False
+
+        # Detect framework and save accordingly
+        framework = _detect_model_framework(model)
+        if not framework:
+            return False
+
+        path = self.dir / "best.pt"
+        old_metric = self._meta.get("best_metric", 0)
+
+        if framework == "pytorch":
             import torch
-        except ImportError:
-            return Path()
+            torch.save(model.state_dict(), path)
+        elif framework == "keras":
+            model.save_weights(str(self.dir / "best.weights.h5"))
+            path = self.dir / "best.weights.h5"
 
-        self._meta["count"] += 1
-        count = self._meta["count"]
-        filename = f"ckpt_{count}_acc{metric_value:.4f}.pt"
-        path = self.dir / filename
-
-        torch.save({
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "metric": metric_value,
-            "config": config,
-            "step": count,
-        }, path)
-
-        # Update latest
-        old_latest = self._meta.get("latest_file", "")
-        self._meta["latest_file"] = filename
-
-        # Update best
-        if metric_value > self._meta.get("best_metric", 0):
-            old_best = self._meta.get("best_file", "")
-            self._meta["best_metric"] = metric_value
-            self._meta["best_file"] = filename
-            # Delete old best (if it's not the new latest)
-            if old_best and old_best != filename:
-                (self.dir / old_best).unlink(missing_ok=True)
-        
-        # Delete old latest (if not best)
-        if old_latest and old_latest != filename and old_latest != self._meta.get("best_file"):
-            (self.dir / old_latest).unlink(missing_ok=True)
-
+        self._meta["best_metric"] = metric_value
+        self._meta["best_file"] = path.name
+        self._meta["framework"] = framework
         self._save_meta()
-        return path
+        return True
 
-    def load_best(self) -> Optional[dict]:
-        """Load the best checkpoint. Returns dict with model, optimizer, metric, config."""
-        try:
-            import torch
-        except ImportError:
-            return None
+    def warm_start(self, model) -> bool:
+        """Load best weights into model. Returns True if loaded."""
+        framework = _detect_model_framework(model)
+        if not framework or framework != self._meta.get("framework", ""):
+            return False
 
         best_file = self._meta.get("best_file", "")
         if not best_file:
-            return None
+            return False
+
         path = self.dir / best_file
         if not path.exists():
-            return None
-        return torch.load(path, weights_only=False)
+            return False
 
-    def load_latest(self) -> Optional[dict]:
-        """Load the most recent checkpoint."""
         try:
-            import torch
-        except ImportError:
-            return None
-
-        latest_file = self._meta.get("latest_file", "")
-        if not latest_file:
-            return None
-        path = self.dir / latest_file
-        if not path.exists():
-            return None
-        return torch.load(path, weights_only=False)
+            if framework == "pytorch":
+                import torch
+                state = torch.load(path, weights_only=True)
+                model.load_state_dict(state, strict=False)
+            elif framework == "keras":
+                model.load_weights(str(path))
+            return True
+        except Exception:
+            return False
 
     @property
     def best_metric(self) -> float:
         return self._meta.get("best_metric", 0.0)
 
     @property
-    def count(self) -> int:
-        return self._meta.get("count", 0)
+    def has_checkpoint(self) -> bool:
+        best_file = self._meta.get("best_file", "")
+        return bool(best_file) and (self.dir / best_file).exists()
 
     def clear(self) -> None:
         """Delete all checkpoints."""
-        for f in self.dir.glob("ckpt_*.pt"):
+        for f in self.dir.glob("best.*"):
             f.unlink()
-        self._meta = {"best_metric": 0.0, "best_file": "", "latest_file": "", "count": 0}
+        self._meta = {"best_metric": 0.0, "best_file": "", "framework": ""}
         self._save_meta()
+
+
+def _detect_model_framework(model) -> str:
+    """Detect if model is PyTorch or Keras."""
+    cls_name = type(model).__module__
+    if "torch" in cls_name:
+        return "pytorch"
+    if "keras" in cls_name or "tensorflow" in cls_name:
+        return "keras"
+    return ""

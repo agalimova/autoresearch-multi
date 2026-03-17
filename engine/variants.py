@@ -110,7 +110,14 @@ def _build_pytorch(n_variants: int = 60, input_dim: int = 784, output_dim: int =
 
 # ── TensorFlow ───────────────────────────────────────────────────────────────
 
-def _build_tensorflow(**_) -> list[dict]:
+def _build_tensorflow(
+    *,
+    input_shape: tuple = (784,),
+    output_units: int = 10,
+    output_activation: str = "softmax",
+    loss: str = "sparse_categorical_crossentropy",
+    **_,
+) -> list[dict]:
     configs = [
         (64, 2, "relu", 0.0, False),
         (64, 2, "gelu", 0.0, False),
@@ -125,48 +132,71 @@ def _build_tensorflow(**_) -> list[dict]:
     ]
     specs = []
     for hidden, depth, act, drop, bn in configs:
-        suffix = f"_bn" if bn else ""
+        suffix = "_bn" if bn else ""
         name = f"tf_h{hidden}_d{depth}_{act}{suffix}"
-        layers = ["        tf.keras.layers.InputLayer(input_shape=(784,)),"]
+        layers = [f"        tf.keras.layers.InputLayer(input_shape={input_shape}),"]
         for _ in range(depth):
             layers.append(f"        tf.keras.layers.Dense({hidden}, activation='{act}'),")
             if bn:
                 layers.append("        tf.keras.layers.BatchNormalization(),")
             if drop > 0:
                 layers.append(f"        tf.keras.layers.Dropout({drop}),")
-        layers.append("        tf.keras.layers.Dense(10, activation='softmax'),")
+        layers.append(f"        tf.keras.layers.Dense({output_units}, activation='{output_activation}'),")
         body = "\n".join(layers)
         specs.append({
             "name": name,
-            "code": f"import tensorflow as tf\n\ndef build_model():\n    return tf.keras.Sequential([\n{body}\n    ])\n",
+            "code": (
+                "import tensorflow as tf\n\n"
+                "def build_model():\n"
+                "    model = tf.keras.Sequential([\n"
+                f"{body}\n"
+                "    ])\n"
+                f"    model.compile(optimizer='adam', loss='{loss}', metrics=['accuracy'])\n"
+                "    return model\n"
+            ),
         })
     return specs
 
 
 # ── Keras (standalone) ───────────────────────────────────────────────────────
 
-def _build_keras(**_) -> list[dict]:
+def _build_keras(
+    *,
+    input_shape: tuple = (784,),
+    output_units: int = 10,
+    output_activation: str = "softmax",
+    loss: str = "sparse_categorical_crossentropy",
+    **_,
+) -> list[dict]:
+    """Generate keras model variants matching the base model's shape and compile args."""
     configs = [
         (64, 2, "relu", 0.0),
         (128, 2, "relu", 0.2),
         (256, 3, "gelu", 0.3),
         (128, 4, "relu", 0.1),
         (512, 2, "relu", 0.2),
-        (128, 2, "relu", 0.0),
     ]
     specs = []
     for hidden, depth, act, drop in configs:
         name = f"keras_h{hidden}_d{depth}_{act}"
-        layers = ["        keras.layers.Input(shape=(784,)),"]
+        layers = [f"        keras.layers.Input(shape={input_shape}),"]
         for _ in range(depth):
             layers.append(f"        keras.layers.Dense({hidden}, activation='{act}'),")
             if drop > 0:
                 layers.append(f"        keras.layers.Dropout({drop}),")
-        layers.append("        keras.layers.Dense(10, activation='softmax'),")
+        layers.append(f"        keras.layers.Dense({output_units}, activation='{output_activation}'),")
         body = "\n".join(layers)
         specs.append({
             "name": name,
-            "code": f"import keras\n\ndef build_model():\n    return keras.Sequential([\n{body}\n    ])\n",
+            "code": (
+                "import keras\n\n"
+                "def build_model():\n"
+                "    model = keras.Sequential([\n"
+                f"{body}\n"
+                "    ])\n"
+                f"    model.compile(optimizer='adam', loss='{loss}', metrics=['accuracy'])\n"
+                "    return model\n"
+            ),
         })
     return specs
 
@@ -195,19 +225,56 @@ def _build_huggingface(num_labels: int = 2, **_) -> list[dict]:
 
 # ── Statsmodels ──────────────────────────────────────────────────────────────
 
-_SM_VARIANTS = [
-    ("sm_ols", "sm.OLS(y, sm.add_constant(X)).fit()"),
-    ("sm_wls", "sm.WLS(y, sm.add_constant(X)).fit()"),
-    ("sm_gls", "sm.GLS(y, sm.add_constant(X)).fit()"),
-    ("sm_rlm", "sm.RLM(y, sm.add_constant(X)).fit()"),
-    ("sm_quantile", "sm.QuantReg(y, sm.add_constant(X)).fit(q=0.5)"),
-    ("sm_logit", "sm.Logit(y, sm.add_constant(X)).fit(disp=0)"),
-    ("sm_probit", "sm.Probit(y, sm.add_constant(X)).fit(disp=0)"),
+# (model_class, fit_kwargs) -- classification models only
+_SM_CLF_VARIANTS = [
+    ("sm_logit", "Logit", ""),
+    ("sm_probit", "Probit", ""),
+    ("sm_mnlogit", "MNLogit", ""),
 ]
+
+# Regression models
+_SM_REG_VARIANTS = [
+    ("sm_ols", "OLS", ""),
+    ("sm_wls", "WLS", ""),
+    ("sm_gls", "GLS", ""),
+    ("sm_rlm", "RLM", ""),
+    ("sm_quantile", "QuantReg", "q=0.5"),
+]
+
+def _sm_wrapper_code(cls: str, fit_kwargs: str = "") -> str:
+    extra = f", {fit_kwargs}" if fit_kwargs else ""
+    return f'''import numpy as np
+import statsmodels.api as sm
+from sklearn.base import BaseEstimator, ClassifierMixin
+
+
+class SMWrapper(BaseEstimator, ClassifierMixin):
+    """Wraps statsmodels {cls} for sklearn cross_val_score."""
+
+    def __init__(self):
+        self.model_ = None
+
+    def fit(self, X, y):
+        X_c = sm.add_constant(X, has_constant="add")
+        self.model_ = sm.{cls}(y, X_c).fit(disp=0{extra})
+        self.classes_ = np.unique(y)
+        return self
+
+    def predict(self, X):
+        X_c = sm.add_constant(X, has_constant="add")
+        pred = self.model_.predict(X_c)
+        if len(self.classes_) == 2:
+            return (pred > 0.5).astype(int)
+        return np.argmax(pred, axis=1)
+
+
+def build_model():
+    return SMWrapper()
+'''
 
 
 def _build_statsmodels(**_) -> list[dict]:
-    return [{
-        "name": name,
-        "code": f"import statsmodels.api as sm\n\ndef build_model():\n    return lambda X, y: {constructor}\n",
-    } for name, constructor in _SM_VARIANTS]
+    return [
+        {"name": name, "code": _sm_wrapper_code(cls, extra)}
+        for name, cls, extra in _SM_CLF_VARIANTS + _SM_REG_VARIANTS
+    ]

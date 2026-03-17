@@ -69,10 +69,74 @@ def _setup_csv_slots(slot_dir: Path, csv_path: str, openml_name: str, target: st
     _write_evaluator(slot_dir / "evaluate" / "base.py")
 
 
+_FRAMEWORK_MARKERS = [
+    ("keras", ["import keras", "from keras"]),
+    ("tensorflow", ["import tensorflow", "from tensorflow"]),
+    ("huggingface", ["from transformers", "import transformers"]),
+    ("pytorch", ["import torch", "from torch"]),
+    ("statsmodels", ["import statsmodels", "from statsmodels"]),
+]
+
+
+def _detect_framework(source: str) -> str:
+    """Detect ML framework from import statements. Returns framework name."""
+    for name, markers in _FRAMEWORK_MARKERS:
+        if any(m in source for m in markers):
+            return name
+    return "sklearn"
+
+
+def _parse_nn_shape(base_path: Path) -> dict:
+    """Extract model shape from a neural net base.py (keras, tf, or pytorch).
+
+    Returns kwargs suitable for passing to the variant generator:
+      keras/tf: input_shape, output_units, output_activation, loss
+      pytorch:  input_dim, output_dim
+    """
+    import re
+    if not base_path.exists():
+        return {}
+
+    code = base_path.read_text()
+    result = {}
+
+    m = re.search(r'(?:input_shape|shape)\s*=\s*\(([^)]+)\)', code)
+    if m:
+        try:
+            dims = tuple(int(x.strip()) for x in m.group(1).split(",") if x.strip())
+            result["input_shape"] = dims
+            result["input_dim"] = dims[0]
+        except ValueError:
+            pass
+
+    dense_matches = list(re.finditer(
+        r'Dense\((\d+)\s*,\s*activation\s*=\s*[\'"](\w+)[\'"]', code,
+    ))
+    if dense_matches:
+        last = dense_matches[-1]
+        result["output_units"] = int(last.group(1))
+        result["output_dim"] = int(last.group(1))
+        result["output_activation"] = last.group(2)
+
+    m = re.search(r'loss\s*=\s*[\'"]([^\'"]+)[\'"]', code)
+    if m:
+        result["loss"] = m.group(1)
+
+    # pytorch: nn.Linear(in, out) -- last one is output layer
+    linear_matches = list(re.finditer(r'nn\.Linear\((\d+)\s*,\s*(\d+)\)', code))
+    if linear_matches:
+        first = linear_matches[0]
+        last = linear_matches[-1]
+        result.setdefault("input_dim", int(first.group(1)))
+        result.setdefault("output_dim", int(last.group(2)))
+
+    return result
+
+
 def _setup_from_py(py_path: Path, slot_dir: Path):
     """Decompose a Python file into slots, auto-detect framework."""
     source = py_path.read_text()
-    framework = "pytorch" if ("import torch" in source or "from torch" in source) else "sklearn"
+    framework = _detect_framework(source)
     print(f"  Detected framework: {framework}")
 
     from engine.decompose import decompose_file
@@ -90,7 +154,10 @@ def _setup_from_py(py_path: Path, slot_dir: Path):
         return
 
     if (slot_dir / "build_model").exists():
-        n = generate(framework, slot_dir / "build_model")
+        kwargs = {}
+        if framework in ("keras", "tensorflow", "pytorch"):
+            kwargs = _parse_nn_shape(slot_dir / "build_model" / "base.py")
+        n = generate(framework, slot_dir / "build_model", **kwargs)
         print(f"  + {n} {framework} model variants")
     if (slot_dir / "engineer_features").exists() and framework == "sklearn":
         _write_features(slot_dir / "engineer_features")
@@ -170,7 +237,14 @@ def _write_evaluator(path: Path):
 # ── LLM round ───────────────────────────────────────────────────────────────
 
 def _llm_rounds(runner, search, results, slot_dir, budget, n_rounds=3):
-    """Iterative LLM: propose → test → read findings → propose better."""
+    """Iterative LLM: propose → test new combos only → feed back → propose better.
+
+    Unlike before, this does NOT call search.run() (which restarts EXPLORE).
+    Instead it:
+      1. Passes search.search_state() to the proposer (interactions, dead families)
+      2. Tests only combos involving the newly proposed impls
+      3. Feeds results back into search.all_results for interaction tracking
+    """
     from engine.llm_proposer import SlotProposer
     from engine.semantic_diff import run_sem_diff
 
@@ -185,6 +259,7 @@ def _llm_rounds(runner, search, results, slot_dir, budget, n_rounds=3):
 
         proposer = SlotProposer(slot_dir, all_results)
         proposer.prior_findings = findings
+        proposer.search_state = search.search_state()
         new_paths = proposer.propose_round(n=2)
 
         if not new_paths:
@@ -201,11 +276,30 @@ def _llm_rounds(runner, search, results, slot_dir, budget, n_rounds=3):
                 diff = run_sem_diff(best_path, path)
                 print(f"  Diff vs {best_impl}: {diff.for_prompt()}")
 
+        # Test only combos involving the new impls, paired with current best
         runner._cache.clear()
         runner._pipeline = None
-        print(f"\n  Testing LLM proposals...")
-        new_results = search.run(n_rounds=1)
+        best_combo = search.search_state()["best_combo"]
+        new_impl_names = [p.stem for p in new_paths]
+        new_results = []
+
+        print(f"\n  Testing {len(new_paths)} LLM proposals...", flush=True)
+        for path in new_paths:
+            slot = path.parent.name
+            impl = path.stem
+            # Test new impl paired with current best for all other slots
+            combo = dict(best_combo)
+            combo[slot] = impl
+            entry = search._test(combo, round_num=4 + rnd)
+            if entry:
+                new_results.append(entry)
+                acc = entry["val_acc"]
+                err = entry.get("error", "")
+                status = f"FAIL: {err[:40]}" if err else f"{acc:.4f}"
+                print(f"    {slot}/{impl}: {status}", flush=True)
+
         all_results.extend(new_results)
+        search._update_interactions()
 
         round_best = max((r.get("val_acc", 0) for r in new_results), default=0)
         improved = round_best > best_so_far
@@ -264,6 +358,78 @@ def _print_results(results, name, elapsed, total, hw):
     print(f"{'Total combos':<25}{total:>7}")
     print(f"{'Time':<25}{elapsed:>6.1f}s")
     print(f"{'Hardware':<25}{hw.device_name[:30]}")
+
+
+def _report_telemetry(results: list, name: str, elapsed: float, search=None):
+    """Report full search history (opt-out via AUTORESEARCH_TELEMETRY=0).
+
+    Sends to Supabase: every combo tested, interactions, dead families,
+    LLM proposals. Also saves locally to results/telemetry.jsonl.
+    """
+    if os.environ.get("AUTORESEARCH_TELEMETRY", "").lower() in ("0", "false", "no", "off"):
+        return
+    try:
+        valid = [r for r in results if not r.get("error")]
+        if not valid:
+            return
+        best = max(valid, key=lambda r: r.get("val_acc", 0))
+        combo = best.get("combo", {})
+        model_impl = combo.get("build_model", "unknown")
+
+        entry = {
+            "timestamp": time.time(),
+            "dataset": name,
+            "best_metric": best.get("val_acc", 0),
+            "best_model": model_impl,
+            "combos_tested": len(results),
+            "elapsed": round(elapsed, 1),
+            "all_results": [
+                {
+                    "combo": r.get("combo", {}),
+                    "val_acc": r.get("val_acc", 0),
+                    "error": r.get("error"),
+                    "round": r.get("round"),
+                }
+                for r in results
+            ],
+        }
+
+        # Add search state if available
+        if search is not None:
+            try:
+                state = search.search_state()
+                entry["interactions"] = state.get("interactions", [])
+                entry["dead_families"] = state.get("dead_families", [])
+                entry["slot_rankings"] = state.get("slot_rankings", {})
+            except Exception:
+                pass
+
+        # Save locally
+        path = Path("results/telemetry.jsonl")
+        path.parent.mkdir(exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+        # Send to Supabase (non-blocking, 2s timeout)
+        import threading
+        def _send():
+            try:
+                import urllib.request
+                url = "https://xxtirszdqdfgfbhgtjfo.supabase.co/rest/v1/telemetry"
+                key = "sb_publishable_ttq-xZWB7B_sZN1Ahi2kwA_Fl2Fm8Ze"
+                data = json.dumps({"payload": entry}).encode("utf-8")
+                req = urllib.request.Request(url, data=data, headers={
+                    "Content-Type": "application/json",
+                    "apikey": key,
+                    "Authorization": f"Bearer {key}",
+                    "Prefer": "return=minimal",
+                }, method="POST")
+                urllib.request.urlopen(req, timeout=2)
+            except Exception:
+                pass
+        threading.Thread(target=_send, daemon=True).start()
+    except Exception:
+        pass  # telemetry failure is never fatal
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -352,6 +518,8 @@ def main():
         "combo": r.get("combo", {}), "val_acc": _val(r), "error": r.get("error"),
     } for r in results], indent=2))
     print(f"\nSaved to {results_path}")
+
+    _report_telemetry(results, name, elapsed, search=search)
 
 
 if __name__ == "__main__":

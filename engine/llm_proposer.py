@@ -167,14 +167,19 @@ def _build_prompt(
     slot_dir: Path,
     results: list[dict],
     prior_findings: list[dict] | None = None,
+    search_state: dict | None = None,
 ) -> str:
-    """Build a prompt for the LLM to propose a new slot variant."""
-    # Show existing variants
+    """Build a prompt for the LLM with full search state context."""
+    # Show existing variants (base in full, others truncated)
     existing = []
     variant_dir = slot_dir / slot_name
     if variant_dir.exists():
         for f in sorted(variant_dir.glob("*.py"))[:5]:
-            existing.append(f"--- {f.name} ---\n{f.read_text()[:300]}")
+            content = f.read_text()
+            if f.name == "base.py":
+                existing.append(f"--- {f.name} (REFERENCE: match this signature exactly) ---\n{content}")
+            else:
+                existing.append(f"--- {f.name} ---\n{content[:300]}")
 
     # Show top results
     top = sorted(results, key=lambda r: r.get("val_acc", 0), reverse=True)[:5]
@@ -203,9 +208,37 @@ def _build_prompt(
                 f"\n  Winner: {f.get('winner', {})}\n"
             )
 
+    # Structured search state from AdaptiveSearch
+    state_str = ""
+    if search_state:
+        # Per-slot rankings for this slot
+        rankings = search_state.get("slot_rankings", {}).get(slot_name, [])
+        if rankings:
+            state_str += "\nPER-IMPL RANKINGS (this slot):\n"
+            for r in rankings[:8]:
+                dead_tag = " [DEAD FAMILY]" if r["dead"] else ""
+                state_str += f"  {r['best_acc']:.4f} | {r['impl']}{dead_tag}\n"
+
+        # Interaction data
+        interactions = search_state.get("interactions", [])
+        if interactions:
+            state_str += "\nINTERACTION EFFECTS (superadditive = good):\n"
+            for ix in interactions[:5]:
+                pair = " + ".join(ix["pair"])
+                delta = ix["delta"]
+                tag = "superadditive" if delta > 0 else "subadditive"
+                state_str += f"  {pair}: {delta:+.4f} ({tag})\n"
+
+        # Dead families
+        dead_fams = search_state.get("dead_families", [])
+        if dead_fams:
+            state_str += f"\nDEAD FAMILIES (don't use these): {', '.join(dead_fams)}\n"
+
+        state_str += f"\nTested {search_state.get('tested_count', 0)} combos so far."
+
     return f"""You are an ML researcher. Write a Python function for the "{slot_name}" slot.
 
-The function must be named `{slot_name}` and follow the same signature as existing variants.
+The function must be named `{slot_name}` with EXACTLY the same parameters and return type as base.py. Do not change the signature.
 
 EXISTING VARIANTS:
 {chr(10).join(existing)}
@@ -215,12 +248,15 @@ TOP RESULTS SO FAR:
 
 DEAD ENDS (these didn't work well):
 {dead_ends}
+{state_str}
 
 PRIOR ROUNDS (what was tried before and what happened):
 {findings_str if findings_str else "  (first round)"}
 
 Based on ALL of the above, propose a NEW variant that might improve accuracy.
 Learn from prior rounds — don't repeat what failed. Build on what worked.
+If there are superadditive interactions, try to exploit them.
+Avoid dead families entirely.
 
 Return ONLY the Python code. No explanation, no markdown fences. Just the code."""
 
@@ -232,14 +268,18 @@ class SlotProposer:
         self.slot_dir = slot_dir
         self.results = results
         self.prior_findings: list[dict] = []
+        self.search_state: Optional[dict] = None
         self._count = 0
 
     def propose(self, slot_name: str) -> Optional[Path]:
         """Propose a new variant for a slot. Returns path or None."""
-        if not os.environ.get("ANTHROPIC_API_KEY"):
+        if not has_llm():
             return None
 
-        prompt = _build_prompt(slot_name, self.slot_dir, self.results, self.prior_findings)
+        prompt = _build_prompt(
+            slot_name, self.slot_dir, self.results,
+            self.prior_findings, self.search_state,
+        )
         response = _call_llm(prompt)
 
         if not response or "def " not in response:
@@ -250,11 +290,21 @@ class SlotProposer:
         if not code:
             return None
 
-        # Write to slot directory
-        self._count += 1
-        name = f"llm_v{self._count}"
+        # Write to slot directory (find next unused name)
         out_dir = self.slot_dir / slot_name
         out_dir.mkdir(parents=True, exist_ok=True)
+        existing_llm = sorted(out_dir.glob("llm_v*.py"))
+        next_num = 1
+        if existing_llm:
+            nums = []
+            for f in existing_llm:
+                try:
+                    nums.append(int(f.stem.split("_v")[1]))
+                except (IndexError, ValueError):
+                    pass
+            if nums:
+                next_num = max(nums) + 1
+        name = f"llm_v{next_num}"
         path = out_dir / f"{name}.py"
         path.write_text(code)
         return path
@@ -272,11 +322,31 @@ class SlotProposer:
         return paths
 
 
+# Slots the LLM should never modify: load_data defines the problem,
+# evaluate defines the metric. Changing either invalidates the comparison.
+_FROZEN_SLOTS = {"load_data", "evaluate"}
+
+
 def _variable_slots(slot_dir: Path) -> list[str]:
-    """Slots with more than 1 variant (worth proposing new ones for)."""
+    """Slots the LLM can propose new variants for.
+
+    For neural net frameworks (keras, tensorflow, pytorch), engineer_features
+    is also frozen because changing feature count breaks the model's input_shape.
+    """
+    frozen = set(_FROZEN_SLOTS)
+
+    # Detect framework from build_model/base.py imports
+    base = slot_dir / "build_model" / "base.py"
+    if base.exists():
+        code = base.read_text()
+        if "keras" in code or "tensorflow" in code or "import torch" in code:
+            frozen.add("engineer_features")
+
     slots = []
     for d in sorted(slot_dir.iterdir()):
         if not d.is_dir():
+            continue
+        if d.name in frozen:
             continue
         n = len(list(d.glob("*.py")))
         if n >= 1:

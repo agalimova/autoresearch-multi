@@ -25,6 +25,29 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 
+def _normalize_Xy(X, y):
+    """Normalize X and y to pandas types with clean integer index.
+
+    LLM-proposed slots may use .iloc, .loc, .unique(), or other
+    pandas-specific APIs. Converting numpy arrays to DataFrame/Series
+    and resetting the index prevents crashes from type or index mismatches.
+    """
+    try:
+        import pandas as pd
+        import numpy as np
+        if isinstance(X, np.ndarray):
+            X = pd.DataFrame(X)
+        if isinstance(y, np.ndarray):
+            y = pd.Series(y)
+        if hasattr(X, "reset_index"):
+            X = X.reset_index(drop=True)
+        if hasattr(y, "reset_index"):
+            y = y.reset_index(drop=True)
+    except Exception:
+        pass
+    return X, y
+
+
 @dataclass
 class SlotResult:
     """Result of running one pipeline combination."""
@@ -37,6 +60,9 @@ class SlotResult:
 class SlotRunner:
     """
     Discovers slot directories, loads implementations, runs the pipeline.
+    
+    For PyTorch/Keras pipelines, warm-starts models from the best checkpoint
+    found so far (if available). Sklearn models are stateless and skip this.
     
     Expected directory structure:
         slots_dir/
@@ -72,6 +98,7 @@ class SlotRunner:
         self.slots_dir = slots_dir
         self._cache: dict[str, Any] = {}
         self._pipeline: Optional[list[tuple[str, str]]] = None
+        self._ckpt = None  # lazy-initialized CheckpointManager
 
     @property
     def pipeline(self) -> list[tuple[str, str]]:
@@ -108,6 +135,31 @@ class SlotRunner:
             ]
             result[slot_name] = impls
         return result
+
+    def _checkpoint(self):
+        """Lazy-init checkpoint manager. Returns manager or None."""
+        if self._ckpt is None:
+            try:
+                from engine.checkpoint import CheckpointManager
+                ckpt_dir = self.slots_dir.parent / "checkpoints"
+                self._ckpt = CheckpointManager(ckpt_dir)
+            except Exception:
+                pass
+        return self._ckpt
+
+    def _warm_start(self, model):
+        """Warm-start model from best checkpoint if available."""
+        ckpt = self._checkpoint()
+        if ckpt and ckpt.has_checkpoint:
+            if ckpt.warm_start(model):
+                return True
+        return False
+
+    def _save_checkpoint(self, model, metric_value: float):
+        """Save model if it beats the current best."""
+        ckpt = self._checkpoint()
+        if ckpt:
+            ckpt.save(model, metric_value=metric_value)
 
     def load_fn(self, slot_name: str, impl_name: str) -> Callable:
         """Load a function from a slot implementation file."""
@@ -169,24 +221,32 @@ class SlotRunner:
             if slot_names == ["load_data", "engineer_features", "build_model", "evaluate"]:
                 df, target = fns["load_data"]()
                 X, y = fns["engineer_features"](df, target)
+                X, y = _normalize_Xy(X, y)
                 model = fns["build_model"]()
+                self._warm_start(model)
                 metrics = fns["evaluate"](X, y, model)
+                self._save_checkpoint(model, metrics.get(metric_name, 0))
             elif slot_names == ["load_data", "vectorize", "build_model", "evaluate"]:
                 df, target = fns["load_data"]()
                 X, y = fns["vectorize"](df, target)
+                X, y = _normalize_Xy(X, y)
                 model = fns["build_model"]()
+                self._warm_start(model)
                 metrics = fns["evaluate"](X, y, model)
+                self._save_checkpoint(model, metrics.get(metric_name, 0))
             elif slot_names == ["load_data", "build_model", "evaluate"]:
-                # Neural net pipeline: load data, build model, evaluate(data, model)
                 data = fns["load_data"]()
                 model = fns["build_model"]()
+                self._warm_start(model)
                 metrics = fns["evaluate"](data, model)
+                self._save_checkpoint(model, metrics.get(metric_name, 0))
             elif slot_names == ["get_transforms", "build_model", "build_optimizer", "evaluate"]:
-                # PyTorch pipeline
                 train_t, test_t = fns["get_transforms"]()
                 model = fns["build_model"]()
+                self._warm_start(model)
                 optimizer = fns["build_optimizer"](model)
                 metrics = fns["evaluate"](train_t, test_t, model, optimizer)
+                self._save_checkpoint(model, metrics.get(metric_name, 0))
             else:
                 raise ValueError(f"Unknown pipeline: {slot_names}")
 
