@@ -30,13 +30,19 @@ dependencies = [
 [project.optional-dependencies]
 torch = ["torch", "torchvision"]
 keras = ["tensorflow"]
+catboost = ["catboost"]
 llm = ["anthropic"]
+llm-all = ["anthropic", "openai", "google-generativeai", "httpx"]
 optuna = ["optuna"]
 all = [
     "torch",
     "torchvision",
     "tensorflow",
+    "catboost",
     "anthropic",
+    "openai",
+    "google-generativeai",
+    "httpx",
     "optuna",
 ]
 

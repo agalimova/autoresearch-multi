@@ -1,23 +1,24 @@
 """
-Swarm scaling law for multi-agent experiments.
+Swarm scaling heuristic for multi-agent experiments (EXPERIMENTAL).
 
-Predicts optimal agent count and diminishing returns threshold
-based on the Neural Swarm Scaling Law from Sreebhargavibalijaa/autoresearch-karpathy.
+This module provides a rough heuristic for estimating how many agents
+to run in parallel. The formula is NOT an empirically validated scaling
+law — it is a simple parametric model for planning purposes.
 
     I(N, C, alpha) = log(N) * sqrt(C) * exp(-alpha / N)
 
 Where:
-    I     = collective intelligence (quality of best finding)
+    I     = estimated collective output quality
     N     = number of agents
     C     = compute capacity (normalized 0-1)
     alpha = communication penalty (higher = more coordination overhead)
 
 Usage:
     from engine.scaling import predict_optimal_agents, scaling_curve
-    
+
     n_opt = predict_optimal_agents(compute=0.5, comm_penalty=0.15)
     print(f"Optimal: {n_opt} agents")
-    
+
     curve = scaling_curve(compute=0.5, comm_penalty=0.15, max_agents=20)
     for n, score in curve:
         print(f"  {n} agents: {score:.3f}")

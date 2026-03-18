@@ -213,42 +213,25 @@ class SlotRunner:
             # Load all functions
             fns = {name: self.load_fn(name, full_combo[name]) for name, _ in self.pipeline}
 
-            # Run pipeline: each slot's output feeds the next slot's input
-            # Convention: first slot returns (DataFrame, target), second takes (df, target),
-            # third takes no args, fourth takes (X, y, model)
+            # Run pipeline: chain slot outputs as inputs to the next slot.
             slot_names = [name for name, _ in self.pipeline]
-
-            if slot_names == ["load_data", "engineer_features", "build_model", "evaluate"]:
-                df, target = fns["load_data"]()
-                X, y = fns["engineer_features"](df, target)
-                X, y = _normalize_Xy(X, y)
-                model = fns["build_model"]()
-                self._warm_start(model)
-                metrics = fns["evaluate"](X, y, model)
+            model = None
+            state = fns[slot_names[0]]()
+            for sn in slot_names[1:]:
+                args = state if isinstance(state, tuple) else (state,)
+                if sn in ("engineer_features", "vectorize"):
+                    state = _normalize_Xy(*fns[sn](*args))
+                elif sn == "build_model":
+                    model = fns[sn]()
+                    self._warm_start(model)
+                    state = (*args, model) if args else (model,)
+                elif sn == "build_optimizer":
+                    state = (*args, fns[sn](model))
+                else:
+                    state = fns[sn](*args)
+            metrics = state if isinstance(state, dict) else {"error": "pipeline returned non-dict"}
+            if model is not None:
                 self._save_checkpoint(model, metrics.get(metric_name, 0))
-            elif slot_names == ["load_data", "vectorize", "build_model", "evaluate"]:
-                df, target = fns["load_data"]()
-                X, y = fns["vectorize"](df, target)
-                X, y = _normalize_Xy(X, y)
-                model = fns["build_model"]()
-                self._warm_start(model)
-                metrics = fns["evaluate"](X, y, model)
-                self._save_checkpoint(model, metrics.get(metric_name, 0))
-            elif slot_names == ["load_data", "build_model", "evaluate"]:
-                data = fns["load_data"]()
-                model = fns["build_model"]()
-                self._warm_start(model)
-                metrics = fns["evaluate"](data, model)
-                self._save_checkpoint(model, metrics.get(metric_name, 0))
-            elif slot_names == ["get_transforms", "build_model", "build_optimizer", "evaluate"]:
-                train_t, test_t = fns["get_transforms"]()
-                model = fns["build_model"]()
-                self._warm_start(model)
-                optimizer = fns["build_optimizer"](model)
-                metrics = fns["evaluate"](train_t, test_t, model, optimizer)
-                self._save_checkpoint(model, metrics.get(metric_name, 0))
-            else:
-                raise ValueError(f"Unknown pipeline: {slot_names}")
 
             return SlotResult(
                 combo=full_combo,

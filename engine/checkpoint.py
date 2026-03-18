@@ -84,9 +84,17 @@ class CheckpointManager:
             if framework == "pytorch":
                 import torch
                 state = torch.load(path, weights_only=True)
-                model.load_state_dict(state, strict=False)
+                try:
+                    model.load_state_dict(state, strict=True)
+                except RuntimeError:
+                    # Architecture mismatch (different combo) — skip warm-start
+                    return False
             elif framework == "keras":
-                model.load_weights(str(path))
+                try:
+                    model.load_weights(str(path))
+                except ValueError:
+                    # Shape mismatch — skip warm-start
+                    return False
             return True
         except Exception:
             return False

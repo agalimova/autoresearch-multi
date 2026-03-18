@@ -334,6 +334,40 @@ class ExperimentTracker:
         ]
         return self.best_of(scores) if scores else None
 
+    def scores_by_option(self, dim: str) -> dict[str, float]:
+        """Best score per option in a dimension."""
+        result: dict[str, float] = {}
+        for e in self.experiments:
+            if e.error:
+                continue
+            opt = e.config.get(dim, "base")
+            prev = result.get(opt)
+            if prev is None or self.is_better(e.score, prev):
+                result[opt] = e.score
+        return result
+
+    def best_in_dim(self, dim: str) -> str:
+        """Best-performing option in a dimension."""
+        scores = self.scores_by_option(dim)
+        if not scores:
+            return "base"
+        return max(scores, key=scores.get) if self.higher_is_better else min(scores, key=scores.get)  # type: ignore[arg-type]
+
+    def near_misses(self, var_dims: list[str]) -> dict[str, list[str]]:
+        """Options within 1% of best per dimension."""
+        near: dict[str, list[str]] = {}
+        for dim in var_dims:
+            scores = self.scores_by_option(dim)
+            if not scores:
+                continue
+            best_val = self.best_of(list(scores.values()))
+            threshold = best_val * (0.99 if self.higher_is_better else 1.01)
+            misses = [o for o, v in scores.items()
+                      if v != best_val and not self._is_worse_than(v, threshold)]
+            if misses:
+                near[dim] = misses
+        return near
+
     def summary_for_prompt(self, *, max_entries: int = 15) -> str:
         """Compact text summary for LLM context injection."""
         lines = []

@@ -6,7 +6,7 @@ Also accepts tabular ML, prunes dead ends automatically, tests more combinations
 
 ## What it does
 
-1. **Decomposes** Python ML pipelines into independent slots (`load_data`, `engineer_features`, `build_model`, `evaluate`) and tests combinations. Detects the framework from imports and generates appropriate model variants. Supports sklearn, PyTorch, TensorFlow, Keras, HuggingFace, and statsmodels.
+1. **Decomposes** Python ML pipelines into independent slots (`load_data`, `engineer_features`, `build_model`, `evaluate`) and tests combinations. Works turnkey with sklearn, PyTorch, TensorFlow, Keras, CatBoost, and statsmodels via `--framework`. Auto-detects framework from imports when given a `.py` file.
 
 2. **Prunes dead ends.** After the first round, losing model families are killed, dominated impls within surviving families are archived, and impls that crash 3 times are auto-skipped. EXPLOIT, COMBINE, and NARROW skip all of them.
 
@@ -40,10 +40,12 @@ pip install autoresearch-multi
 With optional frameworks:
 
 ```bash
-pip install autoresearch-multi[torch]    # + PyTorch
-pip install autoresearch-multi[keras]    # + TensorFlow/Keras
-pip install autoresearch-multi[llm]      # + Claude API
-pip install autoresearch-multi[all]      # everything
+pip install autoresearch-multi[torch]      # + PyTorch
+pip install autoresearch-multi[keras]      # + TensorFlow/Keras
+pip install autoresearch-multi[catboost]   # + CatBoost
+pip install autoresearch-multi[llm]        # + Claude API
+pip install autoresearch-multi[llm-all]    # + all LLM providers (Claude, GPT, Gemini)
+pip install autoresearch-multi[all]        # everything
 ```
 
 Or from source:
@@ -58,9 +60,12 @@ pip install -e .
 
 **Tabular ML** (CSV, OpenML, Python pipelines):
 ```bash
-autoresearch my_data.csv                   # point at a CSV
-autoresearch my_pipeline.py                # point at a Python file (auto-decomposes)
-autoresearch --dataset adult               # use any OpenML dataset
+autoresearch my_data.csv                           # sklearn (default)
+autoresearch my_data.csv --framework pytorch       # PyTorch neural nets
+autoresearch my_data.csv --framework keras          # Keras
+autoresearch my_data.csv --framework catboost       # CatBoost
+autoresearch my_pipeline.py                         # point at a Python file (auto-decomposes)
+autoresearch --dataset adult                        # use any OpenML dataset
 ```
 
 **GPU training** (Karpathy-style, any training script):
@@ -156,41 +161,39 @@ LLM Round 3:   100.00%  (+0.56%, perfect accuracy)
 | Resume support | [buzypi](https://github.com/buzypi/autoresearch) |
 | Warm-start checkpoints | [soveshmohapatra](https://github.com/soveshmohapatra/autoresearch-2.0) |
 | Hardware auto-detection | [elementalcollision](https://github.com/elementalcollision/autoresearch) |
-| Scaling law | [Sreebhargavibalijaa](https://github.com/Sreebhargavibalijaa/autoresearch-karpathy) |
+| Scaling heuristic | [Sreebhargavibalijaa](https://github.com/Sreebhargavibalijaa/autoresearch-karpathy) |
 | TUI dashboard | [elementalcollision](https://github.com/elementalcollision/autoresearch) |
 | Experiment dedup | [mutable-state-inc](https://github.com/mutable-state-inc/autoresearch-at-home) |
 
 ## Project structure
 
 ```
-run.py                       one command, any data
+run.py                       CLI entry point (118 lines)
 engine/
-  adaptive.py                4-mode search + Optuna (original, tabular-only)
-  coordinator.py             unified search loop — any backend (new)
-  backend.py                 Backend protocol + ExperimentTracker (new)
+  coordinator.py             4-mode adaptive search + LLM rounds
+  backend.py                 Backend protocol + ExperimentTracker
+  setup.py                   data loading, code templates, model variants, slot generation
   backends/
-    tabular.py               wraps SlotRunner for tabular ML (new)
-    gpu_training.py           wraps any train script for GPU experiments (new)
-  llm_proposer.py            LLM code proposal (Claude, GPT, Gemini)
-  variants.py                model variant generation (sklearn, pytorch, tf, keras, hf, statsmodels)
-  semantic_diff.py           entity-level code diffs (for LLM mode)
+    tabular.py               wraps SlotRunner for tabular ML
+    gpu_training.py           wraps any training script for GPU experiments
+  llm_proposer.py            LLM code proposal (Claude, GPT, Gemini, Ollama)
   decompose.py               auto-split Python files into slots
-  slots/runner.py            combinatorial slot testing
-  slots/registry.py          version tracking + interaction detection
-  hardware.py                hardware auto-detection
+  slots/runner.py            generic pipeline runner + combinatorial testing
   dashboard.py               TUI dashboard
-  checkpoint.py              warm-start best model across combos (PyTorch, Keras)
-  scaling.py                 swarm scaling law
-  merge.py                   multi-agent A/B merge
+  hardware.py                hardware auto-detection
+  checkpoint.py              warm-start best model across combos
+  scaling.py                 swarm scaling heuristic (experimental)
+  semantic_diff.py           entity-level code diffs (requires `sem` CLI)
+  merge.py                   multi-agent A/B merge (requires `sem` CLI)
 extras/
-  telemetry/                 PII-stripped experiment telemetry (opt-out)
+  telemetry/                 experiment telemetry (opt-out via AUTORESEARCH_TELEMETRY=0)
 ```
 
-The key new files are `coordinator.py`, `backend.py`, and `backends/`. The old `adaptive.py` + `slots/runner.py` path still works unchanged — `TabularBackend` wraps it. `GpuTrainingBackend` adds the Karpathy-style GPU training loop behind the same interface.
+`run.py` wires `Coordinator` + `TabularBackend`. The coordinator drives search through the `Backend` protocol without knowing what runs underneath. `GpuTrainingBackend` plugs in the same way for GPU training.
 
 ## Telemetry
 
-Collects anonymous experiment telemetry by default. PII auto-stripped from all text (names, emails, paths, IPs, credit cards).
+Collects experiment telemetry by default. Saves locally to `results/telemetry.jsonl`. Includes dataset name, best model, combo count, and timing.
 
 **Disable:** `export AUTORESEARCH_TELEMETRY=0`
 
